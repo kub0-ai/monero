@@ -30,7 +30,7 @@ RUN set -ex \
      esac \
   && TARBALL="monero-${ARCH}-v${MONERO_VERSION}.tar.bz2" \
   && curl -SLO "https://downloads.getmonero.org/cli/${TARBALL}" \
-  && curl -SLO "https://www.getmonero.org/downloads/hashes.txt" \
+  && curl -SL "https://raw.githubusercontent.com/monero-project/monero-site/master/downloads/hashes.txt" -o hashes.txt \
   \
   # Import GPG signing keys (binaryFate + any extras provided)
   && for key in ${KEYS}; do \
