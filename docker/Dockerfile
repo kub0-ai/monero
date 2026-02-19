@@ -5,7 +5,7 @@ ARG GID=101
 ARG VERSION=0.18.4.5
 # binaryFate — primary Monero release signer
 # Key: 81AC591FE9C4B65C5806AFC3F0AF4D462A0BDF92
-ARG KEYS="81AC591FE9C4B65C5806AFC3F0AF4D462A0BDF92"
+# Bundled from https://github.com/monero-project/monero/blob/master/utils/gpg_keys/binaryfate.asc
 
 LABEL org.opencontainers.image.source="https://github.com/kub0-ai/monero"
 LABEL org.opencontainers.image.description="Monero (monerod) v${VERSION}"
@@ -22,6 +22,10 @@ ARG TARGETPLATFORM
 ENV MONERO_VERSION=${VERSION}
 ENV MONERO_DATA=/home/monero/.monero
 
+# Import bundled GPG key (no keyserver dependency)
+COPY keys.asc /tmp/keys.asc
+RUN gpg --batch --import /tmp/keys.asc && rm /tmp/keys.asc
+
 RUN set -ex \
   && case "${TARGETPLATFORM}" in \
        linux/amd64) ARCH=linux-x64 ;; \
@@ -31,13 +35,6 @@ RUN set -ex \
   && TARBALL="monero-${ARCH}-v${MONERO_VERSION}.tar.bz2" \
   && curl -SLO "https://downloads.getmonero.org/cli/${TARBALL}" \
   && curl -SL "https://raw.githubusercontent.com/monero-project/monero-site/master/downloads/hashes.txt" -o hashes.txt \
-  \
-  # Import GPG signing keys (binaryFate + any extras provided)
-  && for key in ${KEYS}; do \
-       gpg --batch --keyserver keyserver.ubuntu.com --recv-keys "$key" || \
-       gpg --batch --keyserver keys.openpgp.org    --recv-keys "$key" || \
-       gpg --batch --keyserver pgp.mit.edu         --recv-keys "$key" ; \
-     done \
   \
   # hashes.txt is a PGP-clearsigned file — verify inline signature
   && VERIFY=$(gpg --verify hashes.txt 2>&1 || true) \
