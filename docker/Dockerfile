@@ -37,10 +37,10 @@ RUN set -ex \
   && curl -SL "https://raw.githubusercontent.com/monero-project/monero-site/master/downloads/hashes.txt" -o hashes.txt \
   \
   # hashes.txt is a PGP-clearsigned file — verify inline signature
-  && VERIFY=$(gpg --verify hashes.txt 2>&1 || true) \
+  && VERIFY=$(gpg --verify --status-fd=1 hashes.txt 2>/dev/null || true) \
   && if ! echo "${VERIFY}" | grep -qE "GOODSIG|EXPKEYSIG"; then \
        echo "ERROR: GPG verification of hashes.txt FAILED:"; \
-       echo "${VERIFY}"; \
+       gpg --verify hashes.txt 2>&1 || true; \
        exit 1; \
      fi \
   \
