@@ -1,0 +1,99 @@
+name: Watch Upstream Release
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get latest upstream release
+        id: upstream
+        run: |
+          LATEST=$(curl -s https://api.github.com/repos/monero-project/monero/releases/latest | jq -r '.tag_name')
+          VERSION="${LATEST#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream: $LATEST ($VERSION)"
+
+      - name: Read current version
+        id: current
+        run: |
+          CURRENT=$(cat VERSION | tr -d '[:space:]')
+          echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "Current: $CURRENT"
+
+      - name: Check if update needed
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+          CURRENT="${{ steps.current.outputs.version }}"
+
+          if [ "$VERSION" = "$CURRENT" ]; then
+            echo "Already up to date"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Check if PR already exists for this version
+          EXISTING_PR=$(gh pr list --head "release/${VERSION}" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR #${EXISTING_PR} already open for ${VERSION}, skipping"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "New version available: ${VERSION}"
+          echo "needed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create release PR
+        if: steps.check.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+          BRANCH="release/${VERSION}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Check if remote branch already exists
+          if git ls-remote --exit-code origin "refs/heads/${BRANCH}" >/dev/null 2>&1; then
+            echo "Branch ${BRANCH} exists, fetching"
+            git fetch origin "${BRANCH}"
+            git checkout "${BRANCH}"
+          else
+            git checkout -b "$BRANCH"
+            echo "$VERSION" > VERSION
+            git add VERSION
+            git commit -m "release: bump to v${VERSION}"
+            git push origin "$BRANCH"
+          fi
+
+          gh pr create \
+            --title "Release ${VERSION}" \
+            --body "## Monero ${VERSION}
+
+          Upstream release: https://github.com/monero-project/monero/releases/tag/${{ steps.upstream.outputs.tag }}
+          Hashes: https://www.getmonero.org/downloads/hashes.txt
+
+          ### Signing key
+          \`KEYS\` file contains binaryFate's key (81AC591FE9C4B65C5806AFC3F0AF4D462A0BDF92).
+          Verify the new \`hashes.txt\` is still signed by the same key before merging.
+
+          ### Action required
+          - [ ] Verify hashes.txt GPG signature matches KEYS
+          - [ ] Review upstream release notes for breaking changes
+
+          Merging this PR triggers a build of \`ghcr.io/kub0-ai/monero:${VERSION}\`."
