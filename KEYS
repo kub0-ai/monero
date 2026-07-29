@@ -1,1 +1,5 @@
+# Fingerprint pin for CI policy (documentation + gate).
+# Image trust root is docker/keys.asc ONLY — there is no KEYS Docker build-arg.
+# When updating the release signer, replace docker/keys.asc and this pin together.
+# Primary fingerprint of binaryFate (matches docker/keys.asc):
 81AC591FE9C4B65C5806AFC3F0AF4D462A0BDF92

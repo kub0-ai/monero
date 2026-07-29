@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   check:
@@ -15,7 +16,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Detect upstream + bump main if needed
+      - name: Detect upstream release
+        id: upstream
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -33,18 +35,84 @@ jobs:
           if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
             echo "Could not detect upstream version"; exit 1
           fi
+          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "tag=v${LATEST}" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream (max semver): v${LATEST}"
+
+      - name: Read current version
+        id: current
+        run: |
           CURRENT=$(tr -d '[:space:]' < VERSION)
-          echo "upstream=$LATEST current=$CURRENT"
-          if [ "$LATEST" = "$CURRENT" ]; then
+          echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "Current: $CURRENT"
+
+      - name: Check if update needed
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+          CURRENT="${{ steps.current.outputs.version }}"
+          if [ "$VERSION" = "$CURRENT" ]; then
             echo "Already up to date"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Direct bump on main → build.yml (paths: VERSION) rebuilds the image.
-          # Org setting blocks Actions from opening PRs; direct commit is the reliable path.
+          EXISTING_PR=$(gh pr list --head "release/${VERSION}" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR #${EXISTING_PR} already open for ${VERSION}"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "New version available: ${VERSION}"
+          echo "needed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update release PR (human gate — no direct main push)
+        if: steps.check.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+          BRANCH="release/${VERSION}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          echo "$LATEST" > VERSION
-          git add VERSION
-          git commit -m "release: bump to v${LATEST} (auto from ${UPSTREAM_REPO})"
-          git push origin HEAD:main
-          echo "Pushed VERSION ${CURRENT} → ${LATEST}; build.yml will remake the image"
+
+          if git ls-remote --exit-code origin "refs/heads/${BRANCH}" >/dev/null 2>&1; then
+            git fetch origin "${BRANCH}"
+            git checkout "${BRANCH}"
+            echo "$VERSION" > VERSION
+            if ! git diff --quiet VERSION; then
+              git add VERSION
+              git commit -m "release: bump to v${VERSION}"
+              git push origin "${BRANCH}"
+            fi
+          else
+            git checkout -b "$BRANCH"
+            echo "$VERSION" > VERSION
+            git add VERSION
+            git commit -m "release: bump to v${VERSION}"
+            git push origin "$BRANCH"
+          fi
+
+          if ! gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' | grep -q .; then
+            gh pr create \
+              --title "Release ${VERSION}" \
+              --body "$(cat <<EOF
+          ## Monero ${VERSION}
+
+          Upstream release: https://github.com/monero-project/monero/releases/tag/${{ steps.upstream.outputs.tag }}
+          Downloads: https://downloads.getmonero.org/cli/
+
+          ### Trust root
+          Image builds import \`docker/keys.asc\` only (binaryFate). Repo-root \`KEYS\` is the fingerprint pin for CI policy — not a Docker build-arg.
+
+          ### Action required (human gate — GPG)
+          - [ ] Confirm hashes.txt verifies with GOODSIG from binaryFate (\`81AC591FE9C4B65C5806AFC3F0AF4D462A0BDF92\`)
+          - [ ] Review upstream release notes for breaking changes
+          - [ ] If the release signer changes, update \`docker/keys.asc\` **and** the fingerprint in \`KEYS\` together
+
+          Merging this PR triggers a build of \`ghcr.io/kub0-ai/monero:${VERSION}\`.
+          Direct pushes to main for VERSION bumps are intentionally disabled.
+          EOF
+          )" || true
+          fi

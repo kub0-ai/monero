@@ -4,11 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Monero version (e.g., 0.18.4.5)'
+        description: 'Monero version (e.g., 0.18.5.1)'
         required: true
       keys:
-        description: 'GPG keys (space-separated, overrides KEYS file)'
+        description: 'Optional fingerprint override (must match docker/keys.asc primary fpr / KEYS pin). Empty = use KEYS file. Fake/mismatched keys fail the job.'
         required: false
+        default: ''
 
 permissions:
   contents: write
@@ -21,13 +22,44 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Resolve KEYS
+      - name: Enforce fingerprint policy (no fake-keys free publish)
         id: keys
         run: |
-          if [ -n "${{ github.event.inputs.keys }}" ]; then
-            echo "keys=${{ github.event.inputs.keys }}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          PIN=$(grep -oE '[0-9A-Fa-f]{40}' KEYS | head -1 | tr 'a-f' 'A-F')
+          FPR=$(gpg --show-keys --with-colons docker/keys.asc 2>/dev/null \
+            | awk -F: '/^fpr:/{print $10; exit}')
+          FPR=$(echo "$FPR" | tr 'a-f' 'A-F')
+          if [ -z "$PIN" ] || [ -z "$FPR" ]; then
+            echo "ERROR: could not read KEYS pin or keys.asc fingerprint"; exit 1
+          fi
+          if [ "$PIN" != "$FPR" ]; then
+            echo "ERROR: KEYS pin ($PIN) != keys.asc primary fpr ($FPR)"; exit 1
+          fi
+
+          INPUT_RAW="${{ github.event.inputs.keys }}"
+          # Strip whitespace; if non-empty, every token must equal the pinned fpr
+          if [ -n "$(echo "$INPUT_RAW" | tr -d '[:space:]')" ]; then
+            for tok in $INPUT_RAW; do
+              TOK=$(echo "$tok" | tr -d '[:space:]' | tr 'a-f' 'A-F')
+              [ -z "$TOK" ] && continue
+              if [ "$TOK" != "$PIN" ]; then
+                echo "ERROR: input key fingerprint $TOK does not match keys.asc / KEYS pin $PIN"
+                echo "Image always imports docker/keys.asc; CI keys input cannot swap the trust root."
+                exit 1
+              fi
+            done
+            echo "keys input matches pin: $PIN"
           else
-            echo "keys=$(tr '\n' ' ' < KEYS)" >> "$GITHUB_OUTPUT"
+            echo "keys input empty — using KEYS pin $PIN (keys.asc is image trust root)"
+          fi
+          echo "pin=$PIN" >> "$GITHUB_OUTPUT"
+
+      - name: Validate version input
+        run: |
+          V="${{ github.event.inputs.version }}"
+          if [ -z "$V" ] || ! echo "$V" | grep -qE '^[0-9]+(\.[0-9]+){1,3}$'; then
+            echo "ERROR: invalid version input: $V"; exit 1
           fi
 
       - name: Set up QEMU
@@ -49,9 +81,9 @@ jobs:
           context: ./docker
           platforms: linux/amd64,linux/arm64
           push: true
+          # keys.asc sole trust root — no KEYS build-arg (was dead code)
           build-args: |
             VERSION=${{ github.event.inputs.version }}
-            KEYS=${{ steps.keys.outputs.keys }}
           tags: ghcr.io/kub0-ai/monero:${{ github.event.inputs.version }}
           cache-from: type=registry,ref=ghcr.io/kub0-ai/monero:buildcache
           cache-to: type=registry,ref=ghcr.io/kub0-ai/monero:buildcache,mode=max

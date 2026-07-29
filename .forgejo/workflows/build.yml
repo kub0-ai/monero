@@ -14,11 +14,27 @@ jobs:
 
       - name: Read VERSION
         id: version
-        run: echo "version=$(cat VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+        run: |
+          V=$(tr -d '[:space:]' < VERSION)
+          if [ -z "$V" ]; then
+            echo "VERSION file is empty"; exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
 
-      - name: Read KEYS
-        id: keys
-        run: echo "keys=$(tr '\n' ' ' < KEYS)" >> "$GITHUB_OUTPUT"
+      - name: Assert KEYS pin matches keys.asc
+        run: |
+          set -euo pipefail
+          PIN=$(grep -oE '[0-9A-Fa-f]{40}' KEYS | head -1 | tr 'a-f' 'A-F')
+          FPR=$(gpg --show-keys --with-colons docker/keys.asc 2>/dev/null \
+            | awk -F: '/^fpr:/{print $10; exit}')
+          FPR=$(echo "$FPR" | tr 'a-f' 'A-F')
+          if [ -z "$PIN" ] || [ -z "$FPR" ]; then
+            echo "ERROR: could not read KEYS pin or keys.asc fingerprint"; exit 1
+          fi
+          if [ "$PIN" != "$FPR" ]; then
+            echo "ERROR: KEYS pin ($PIN) != keys.asc primary fpr ($FPR)"; exit 1
+          fi
+          echo "KEYS pin matches keys.asc: $PIN"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -39,9 +55,9 @@ jobs:
           context: ./docker
           platforms: linux/amd64,linux/arm64
           push: true
+          # keys.asc is sole trust root inside the image — no KEYS build-arg
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
-            KEYS=${{ steps.keys.outputs.keys }}
           tags: |
             ghcr.io/kub0-ai/monero:${{ steps.version.outputs.version }}
             ghcr.io/kub0-ai/monero:latest

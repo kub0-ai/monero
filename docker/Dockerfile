@@ -2,10 +2,14 @@ FROM debian:bookworm-slim
 
 ARG UID=101
 ARG GID=101
-ARG VERSION=0.18.4.5
-# binaryFate — primary Monero release signer
+# VERSION must be passed explicitly (CI reads the repo VERSION file).
+# No silent stale default — bare `docker build` without --build-arg fails.
+ARG VERSION
+# Trust root: docker/keys.asc only (bundled binaryFate pubkey).
+# Repo-root KEYS is a fingerprint documentation pin for CI policy — it is NOT
+# imported here and there is no KEYS build-arg. Do not pass KEYS= to docker build.
 # Key: 81AC591FE9C4B65C5806AFC3F0AF4D462A0BDF92
-# Bundled from https://github.com/monero-project/monero/blob/master/utils/gpg_keys/binaryfate.asc
+# Source: https://github.com/monero-project/monero/blob/master/utils/gpg_keys/binaryfate.asc
 
 LABEL org.opencontainers.image.source="https://github.com/kub0-ai/monero"
 LABEL org.opencontainers.image.description="Monero (monerod) v${VERSION}"
@@ -22,7 +26,10 @@ ARG TARGETPLATFORM
 ENV MONERO_VERSION=${VERSION}
 ENV MONERO_DATA=/home/monero/.monero
 
-# Import bundled GPG key (no keyserver dependency)
+# Fail fast if VERSION was not supplied (empty ARG default)
+RUN test -n "${MONERO_VERSION}" || (echo "ERROR: VERSION build-arg is required (e.g. --build-arg VERSION=\$(cat VERSION))" && exit 1)
+
+# Import bundled GPG key (no keyserver dependency; keys.asc is sole trust root)
 COPY keys.asc /tmp/keys.asc
 RUN gpg --batch --import /tmp/keys.asc && rm /tmp/keys.asc
 
@@ -36,10 +43,10 @@ RUN set -ex \
   && curl -SLO "https://downloads.getmonero.org/cli/${TARBALL}" \
   && curl -SL "https://raw.githubusercontent.com/monero-project/monero-site/master/downloads/hashes.txt" -o hashes.txt \
   \
-  # hashes.txt is a PGP-clearsigned file — verify inline signature
+  # hashes.txt is a PGP-clearsigned file — require GOODSIG only (expired-key status is not success)
   && VERIFY=$(gpg --verify --status-fd=1 hashes.txt 2>/dev/null || true) \
-  && if ! echo "${VERIFY}" | grep -qE "GOODSIG|EXPKEYSIG"; then \
-       echo "ERROR: GPG verification of hashes.txt FAILED:"; \
+  && if ! echo "${VERIFY}" | grep -qE "GOODSIG"; then \
+       echo "ERROR: GPG verification of hashes.txt FAILED (GOODSIG required; expired-key status not accepted):"; \
        gpg --verify hashes.txt 2>&1 || true; \
        exit 1; \
      fi \
