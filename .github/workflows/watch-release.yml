@@ -1,5 +1,24 @@
 name: Watch Upstream Release
 
+# Two-stage release automation with a SIGNER-CONDITIONAL human gate.
+#
+#   detect upstream -> preflight the Dockerfile's own GPG gate -> decide:
+#     PASS : auto-merge the release PR, then dispatch build.yml. Hands-off.
+#            The bundled trust root already covers this release, so a human
+#            clicking "merge" adds no security -- only latency.
+#     FAIL : open/keep the PR, DO NOT merge, exit 1 (red). A human must review.
+#
+# NOTE: monero's trust root is docker/keys.asc (binaryFate), bundled in-repo --
+# NOT the root KEYS file, which docker/Dockerfile documents as a policy pin and
+# never imports. There is no allowlist loop to mirror: the keyring holds exactly
+# the trusted key, so ">=1 GOODSIG" IS the whole gate.
+#
+# The second, monero-specific failure mode is timing: hashes are published to
+# monero-project/monero-site (branch master) SEPARATELY from the GitHub release,
+# so a freshly tagged version routinely has no hashes.txt entry yet. Building
+# then fails on a missing checksum line. Preflighting the entry turns that from
+# a red build into a held PR that clears itself on the next daily run.
+
 on:
   schedule:
     - cron: '0 6 * * *'
@@ -8,6 +27,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write # required to dispatch build.yml
 
 jobs:
   check:
@@ -15,6 +35,30 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # "In a public repository, scheduled workflows are automatically disabled
+      # when no repository activity has occurred in 60 days." A quiet upstream
+      # therefore kills this watcher -- and GitHub does NOT re-enable on new
+      # activity, it requires a manual click. So keep the repo warm well inside
+      # the window rather than trying to cure it afterwards. Runs daily, acts
+      # roughly monthly, and sustains itself because acting resets the clock.
+      - name: Keepalive (prevent 60-day cron auto-disable)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          LAST=$(git log -1 --format=%ct main 2>/dev/null || git log -1 --format=%ct)
+          AGE=$(( ( $(date +%s) - LAST ) / 86400 ))
+          echo "days since last commit on main: ${AGE}"
+          if [ "$AGE" -ge 40 ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keepalive — hold scheduled workflows active (${AGE}d quiet)"
+            git push origin HEAD:main
+            echo "::notice title=Keepalive::pushed empty commit after ${AGE} quiet days"
+          fi
 
       - name: Detect upstream release
         id: upstream
@@ -42,6 +86,7 @@ jobs:
       - name: Read current version
         id: current
         run: |
+          set -euo pipefail
           CURRENT=$(tr -d '[:space:]' < VERSION)
           echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
           echo "Current: $CURRENT"
@@ -49,70 +94,189 @@ jobs:
       - name: Check if update needed
         id: check
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM: ${{ steps.upstream.outputs.version }}
+          CURRENT: ${{ steps.current.outputs.version }}
         run: |
-          VERSION="${{ steps.upstream.outputs.version }}"
-          CURRENT="${{ steps.current.outputs.version }}"
-          if [ "$VERSION" = "$CURRENT" ]; then
-            echo "Already up to date"
+          set -euo pipefail
+          if [ "$UPSTREAM" = "$CURRENT" ]; then
+            echo "Already up to date at ${CURRENT}"
             echo "needed=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Up to date"
+              echo ""
+              echo "\`VERSION\` = upstream latest = \`${CURRENT}\`. Nothing to do."
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          EXISTING_PR=$(gh pr list --head "release/${VERSION}" --state open --json number --jq '.[0].number // empty')
-          if [ -n "$EXISTING_PR" ]; then
-            echo "PR #${EXISTING_PR} already open for ${VERSION}"
-            echo "needed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "New version available: ${VERSION}"
+          echo "New version available: ${CURRENT} -> ${UPSTREAM}"
           echo "needed=true" >> "$GITHUB_OUTPUT"
 
-      - name: Create or update release PR (human gate — no direct main push)
+      # Preflight the EXACT gate docker/Dockerfile applies at build time:
+      #   import docker/keys.asc as the sole trust root (no keyserver, no TOFU),
+      #   require >=1 GOODSIG on the clearsigned hashes.txt,
+      #   and additionally require the new version's tarball line to EXIST.
+      - name: Preflight signing gate
         if: steps.check.outputs.needed == 'true'
+        id: gpg
+        env:
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+          WORK=$(mktemp -d); export GNUPGHOME=$(mktemp -d); chmod 700 "$GNUPGHOME"
+
+          gpg --batch --import docker/keys.asc >/dev/null 2>&1
+          curl -sSLf -o "$WORK/hashes.txt" \
+            "https://raw.githubusercontent.com/monero-project/monero-site/master/downloads/hashes.txt"
+
+          STATUS=$(gpg --verify --status-fd=1 "$WORK/hashes.txt" 2>/dev/null || true)
+
+          # NOTE: herestrings, not pipelines. `CMD | grep -q PAT` under pipefail
+          # returns 141 (SIGPIPE) when PAT matches, which silently inverts the
+          # test. Feed grep from <<< so there is no pipe to break.
+          GOOD=$(grep -c '^\[GNUPG:\] GOODSIG '   <<< "$STATUS" || true)
+          UNKNOWN=$(grep -c '^\[GNUPG:\] NO_PUBKEY ' <<< "$STATUS" || true)
+          EXPIRED=$(grep -c '^\[GNUPG:\] EXPKEYSIG ' <<< "$STATUS" || true)
+
+          # Does hashes.txt actually carry this version yet? monero-site lags the
+          # GitHub release, so this is the common held state, not a signer problem.
+          HASHED=$(grep -c "monero-linux-x64-v${VERSION}\.tar\.bz2" "$WORK/hashes.txt" || true)
+
+          VERDICT=pass
+          REASON="gate satisfied"
+          if [ "$GOOD" -lt 1 ]; then
+            VERDICT=fail
+            REASON="no GOODSIG on hashes.txt from the bundled trust root (EXPKEYSIG alone is not accepted)"
+          elif [ "$HASHED" -lt 1 ]; then
+            VERDICT=fail
+            REASON="hashes.txt is validly signed but carries no entry for v${VERSION} yet — monero-site lags the release; this clears itself on a later run"
+          fi
+
+          {
+            echo "verdict=$VERDICT"
+            echo "reason=$REASON"
+            echo "good=$GOOD"
+            echo "unknown=$UNKNOWN"
+            echo "expired=$EXPIRED"
+            echo "hashed=$HASHED"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Signing preflight for ${VERSION} — **${VERDICT}**"
+            echo ""
+            echo "| signal | count |"
+            echo "|---|---|"
+            echo "| GOODSIG (bundled trust root) | ${GOOD} |"
+            echo "| EXPKEYSIG (trusted but expired) | ${EXPIRED} |"
+            echo "| hashes.txt entry for v${VERSION} | ${HASHED} |"
+            echo ""
+            echo "Verdict reason: ${REASON}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "preflight ${VERDICT}: ${REASON} (good=${GOOD} expired=${EXPIRED} hashed=${HASHED})"
+
+      - name: Create or update release PR
+        if: steps.check.outputs.needed == 'true'
+        id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          VERDICT: ${{ steps.gpg.outputs.verdict }}
+          REASON: ${{ steps.gpg.outputs.reason }}
+          GOOD: ${{ steps.gpg.outputs.good }}
+          EXPIRED: ${{ steps.gpg.outputs.expired }}
+          HASHED: ${{ steps.gpg.outputs.hashed }}
         run: |
-          VERSION="${{ steps.upstream.outputs.version }}"
+          set -euo pipefail
           BRANCH="release/${VERSION}"
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           if git ls-remote --exit-code origin "refs/heads/${BRANCH}" >/dev/null 2>&1; then
-            git fetch origin "${BRANCH}"
-            git checkout "${BRANCH}"
-            echo "$VERSION" > VERSION
-            if ! git diff --quiet VERSION; then
-              git add VERSION
-              git commit -m "release: bump to v${VERSION}"
-              git push origin "${BRANCH}"
-            fi
+            git fetch origin "$BRANCH"
+            git checkout "$BRANCH"
           else
             git checkout -b "$BRANCH"
-            echo "$VERSION" > VERSION
+          fi
+          echo "$VERSION" > VERSION
+          if ! git diff --quiet VERSION; then
             git add VERSION
             git commit -m "release: bump to v${VERSION}"
-            git push origin "$BRANCH"
           fi
+          git push origin "$BRANCH"
 
-          if ! gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' | grep -q .; then
-            gh pr create \
+          NUM=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$NUM" ]; then
+            gh pr create --head "$BRANCH" --base main \
               --title "Release ${VERSION}" \
               --body "$(cat <<EOF
           ## Monero ${VERSION}
 
-          Upstream release: https://github.com/monero-project/monero/releases/tag/${{ steps.upstream.outputs.tag }}
-          Downloads: https://downloads.getmonero.org/cli/
+          Upstream release: https://github.com/monero-project/monero/releases/tag/${TAG}
 
-          ### Trust root
-          Image builds import \`docker/keys.asc\` only (binaryFate). Repo-root \`KEYS\` is the fingerprint pin for CI policy — not a Docker build-arg.
+          ### Signing preflight — **${VERDICT}**
 
-          ### Action required (human gate — GPG)
-          - [ ] Confirm hashes.txt verifies with GOODSIG from binaryFate (\`81AC591FE9C4B65C5806AFC3F0AF4D462A0BDF92\`)
-          - [ ] Review upstream release notes for breaking changes
-          - [ ] If the release signer changes, update \`docker/keys.asc\` **and** the fingerprint in \`KEYS\` together
+          | signal | count |
+          |---|---|
+          | GOODSIG (bundled trust root) | ${GOOD} |
+          | EXPKEYSIG (trusted but expired) | ${EXPIRED} |
+          | hashes.txt entry for v${VERSION} | ${HASHED} |
 
-          Merging this PR triggers a build of \`ghcr.io/kub0-ai/monero:${VERSION}\`.
-          Direct pushes to main for VERSION bumps are intentionally disabled.
+          ${REASON}
+
+          Trust root is \`docker/keys.asc\` (binaryFate), bundled in-repo — the root
+          \`KEYS\` file is a documentation pin and is never imported by the build.
+
+          A **pass** means the bundled key verifies upstream's hashes and the entry for
+          this version exists — this PR is auto-merged and built.
+
+          A **fail** is most often just timing: monero-site publishes hashes separately
+          from the GitHub release, so the entry may not exist yet. It clears itself on a
+          later daily run. A *signature* failure is the serious case — verify the key
+          against upstream's \`utils/gpg_keys/\` before changing anything.
           EOF
-          )" || true
+          )"
+            NUM=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
           fi
+          echo "number=$NUM" >> "$GITHUB_OUTPUT"
+          echo "Release PR #${NUM} for ${VERSION}"
+
+      - name: Auto-merge and dispatch build (preflight passed)
+        if: steps.check.outputs.needed == 'true' && steps.gpg.outputs.verdict == 'pass'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+          NUM: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          gh pr merge "$NUM" --merge --delete-branch
+
+          # The merge above is authenticated with GITHUB_TOKEN, so its push does
+          # NOT trigger build.yml. Dispatch explicitly -- workflow_dispatch is a
+          # documented exception to the anti-recursion rule and always runs.
+          gh workflow run build.yml --ref main
+          {
+            echo ""
+            echo "### Auto-merged"
+            echo ""
+            echo "PR #${NUM} merged; \`build.yml\` dispatched on \`main\` for \`${VERSION}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Hold for human review (preflight failed)
+        if: steps.check.outputs.needed == 'true' && steps.gpg.outputs.verdict != 'pass'
+        env:
+          VERSION: ${{ steps.upstream.outputs.version }}
+          REASON: ${{ steps.gpg.outputs.reason }}
+          NUM: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          {
+            echo ""
+            echo "### HELD — preflight not satisfied"
+            echo ""
+            echo "PR #${NUM} (\`${VERSION}\`) is open and **not** merged: ${REASON}"
+            echo ""
+            echo "This run fails deliberately so the stall is visible in the runs list."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Release ${VERSION} held::${REASON} — see PR #${NUM}"
+          exit 1
